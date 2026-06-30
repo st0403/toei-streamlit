@@ -1,405 +1,417 @@
+# app.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import io
 import math
-import streamlit as st
+import re
+import unicodedata
+from datetime import date
+from typing import Optional
+
 import pandas as pd
-import jpholiday
+import streamlit as st
 
-st.set_page_config(page_title="勤怠データ抽出・支給額計算", layout="wide")
-st.title("勤怠データ抽出・支給額計算ツール")
+# =========================
+# 設定
+# =========================
+STORE_NAME_DEFAULT = "コメダ珈琲店 千歳北信濃店"
+PREMIUM_PER_HOUR = 100
 
-# ── ファイルアップロード ──────────────────────────────────────────────────────
-c1, c2 = st.columns(2)
-with c1:
-    uploaded = st.file_uploader("① 日次勤怠CSV", type="csv", key="csv_upload")
-with c2:
-    wage_uploaded = st.file_uploader("② 従業員基本給CSV（時給テンプレート）", type="csv", key="wage_csv")
+RATES = {
+    "所定内労働": 1.0,
+    "法定内残業": 1.0,
+    "時間外労働": 1.25,
+    "法定休日労働": 1.35,
+    "深夜労働": 0.25,
+}
 
-if uploaded is None or wage_uploaded is None:
-    missing = []
-    if uploaded is None:
-        missing.append("日次勤怠CSV")
-    if wage_uploaded is None:
-        missing.append("従業員基本給CSV")
-    st.info(f"{'・'.join(missing)} をアップロードしてください。")
-    st.stop()
+COL_EMP_NO = "従業員番号"
+COL_NAME = "氏名"
+COL_DATE = "日付"
+COL_DEPT = "部門"
+COL_CLOCK_IN = "出勤時刻"
+COL_ATTENDANCE_TYPE = "勤怠種別"  # 有給休暇の判定に使用
 
-# ── データ読み込み ────────────────────────────────────────────────────────────
-df = pd.read_csv(uploaded, encoding="utf-8-sig")
-df.columns = df.columns.str.strip()
-df["日付"] = pd.to_datetime(df["日付"], errors="coerce")
-df["従業員番号"] = df["従業員番号"].astype(str).str.strip()
+TIME_COLS = {
+    "所定内労働": "所定内労働時間",
+    "法定内残業": "法定内残業時間",
+    "時間外労働": "時間外労働時間",
+    "法定休日労働": "法定休日労働時間",
+    "深夜労働": "深夜労働時間",
+}
 
-df_wage = pd.read_csv(wage_uploaded, encoding="utf-8-sig")
-df_wage.columns = df_wage.columns.str.strip()
-df_wage["従業員番号"] = df_wage["従業員番号"].astype(str).str.strip()
+# =========================
+# 共通関数
+# =========================
+def normalize_text(v) -> str:
+    if pd.isna(v):
+        return ""
+    s = str(v)
+    s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u3000", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-wage_cols = df_wage.columns.tolist()
-early_col   = next((c for c in wage_cols if "早朝" in c), None)
-weekend_col = next((c for c in wage_cols if "土日祝" in c), None)
-
-sel = ["従業員番号", "基本給"]
-if early_col:   sel.append(early_col)
-if weekend_col: sel.append(weekend_col)
-
-rename_map = {"基本給": "基本時給"}
-if early_col:   rename_map[early_col]   = "早朝時給"
-if weekend_col: rename_map[weekend_col] = "土日祝時給"
-
-dw = df_wage[sel].copy().rename(columns=rename_map)
-for c in ["基本時給", "早朝時給", "土日祝時給"]:
-    dw[c] = pd.to_numeric(dw.get(c, 0), errors="coerce").fillna(0)
-
-df = df.merge(dw, on="従業員番号", how="left")
-for c in ["基本時給", "早朝時給", "土日祝時給"]:
-    if c not in df.columns:
-        df[c] = 0
-    df[c] = df[c].fillna(0)
-
-# ── ヘルパー関数 ──────────────────────────────────────────────────────────────
-def is_weekend_or_holiday(dt):
-    if pd.isna(dt):
-        return False
-    return dt.weekday() >= 5 or jpholiday.is_holiday(dt.date())
-
-def parse_hhmm(val):
-    if pd.isna(val) or str(val).strip() == "":
+def hhmm_to_minutes(v) -> int:
+    if pd.isna(v):
         return 0
-    parts = str(val).strip().split(":")
-    if len(parts) < 2:
+    s = str(v)
+    if ":" not in s:
         return 0
-    try:
-        return int(parts[0]) * 60 + int(parts[1])
-    except ValueError:
-        return 0
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
 
-def parse_col(series):
-    return series.apply(parse_hhmm)
+def safe_read_csv(upload) -> pd.DataFrame:
+    raw = upload.getvalue()
+    for enc in ("utf-8-sig", "cp932"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+        except:
+            pass
+    return pd.read_csv(io.BytesIO(raw), encoding="utf-8")
 
-def hhmm(m):
-    m = int(m)
-    return f"{m // 60:02d}:{m % 60:02d}"
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """月内の第n番目のweekday（0=月）の日付を返す"""
+    first = date(year, month, 1)
+    # first の曜日を 0=月 に合わせる
+    offset = (weekday - first.weekday()) % 7
+    if n > 1:
+        offset += 7 * (n - 1)
+    return first.replace(day=1 + offset)
 
-def yen(v):
-    return f"¥{int(round(v)):,}"
 
-def calc_early_min(row):
-    ws, we = 360, 540
-    s = parse_hhmm(row.get("出勤時刻", ""))
-    e = parse_hhmm(row.get("退勤時刻", ""))
-    if s == 0 or e == 0:
-        return 0
-    gross = max(0, min(e, we) - max(s, ws))
-    if gross == 0:
-        return 0
-    for bi, bo in [("休憩1入り時刻","休憩1戻り時刻"),
-                   ("休憩2入り時刻","休憩2戻り時刻"),
-                   ("休憩3入り時刻","休憩3戻り時刻")]:
-        bs = parse_hhmm(row.get(bi, ""))
-        be = parse_hhmm(row.get(bo, ""))
-        if bs and be:
-            gross -= max(0, min(be, we) - max(bs, ws))
-    return max(0, gross)
+def _vernal_equinox_day(year: int) -> int:
+    """春分の日の「日」（3月） 1980-2099 簡易式"""
+    if year < 1980 or year > 2099:
+        return 20
+    return int(20.8431 + 0.242194 * (year - 1980) - (year - 1980) // 4)
 
-def calc_early_overtime_min(row):
-    WINDOW_END = 540
-    sched_end  = parse_hhmm(row.get("勤務予定退勤時刻", ""))
-    actual_end = parse_hhmm(row.get("退勤時刻", ""))
-    if sched_end <= 0 or sched_end > WINDOW_END:
-        return 0
-    if actual_end <= sched_end:
-        return 0
-    return max(0, min(actual_end, WINDOW_END) - sched_end)
 
-# ── 支給額計算ユーティリティ ─────────────────────────────────────────────────
-# 割増率
-#   所定内・法定内残業: ×1.00（差額のみ、追加割増なし）
-#   時間外:           ×1.25
-#   法定休日:         ×1.35
-#   深夜:             ×0.25（25%分の追加のみ）
-#
-# 計算式:
-#   基本給分  = 基本時給   × 割増率 × 月合計時間  （給与ソフト既算・参照用）
-#   差額追加分 = 差額時給  × 割増率 × 月合計時間  （今回追加で支給する分）
-#   差額時給  = 特別時給 − 基本時給
-#   合計      = 基本給分 + 差額追加分
+def _autumnal_equinox_day(year: int) -> int:
+    """秋分の日の「日」（9月） 1980-2099 簡易式"""
+    if year < 1980 or year > 2099:
+        return 23
+    return int(23.2488 + 0.242194 * (year - 1980) - (year - 1980) // 4)
 
-def ceil_pay(rate, mult, minutes):
-    """分数を時間に変換し、切り上げて金額を返す（1円未満切り上げ）。"""
-    return math.ceil(rate * mult * minutes / 60)
 
-def make_pay_table(grp_df, rate_col, base_col, items, base_only_items=None):
-    """
-    grp_df          : 従業員別月次集計済み DataFrame
-    rate_col        : 特別時給カラム名 ("土日祝時給" or "早朝時給")
-    base_col        : 基本時給カラム名
-    items           : [(label, min_col, mult), ...]  ← 差額計算あり
-    base_only_items : [(label, min_col, mult), ...]  ← 基本時給のみ（差額なし）
-
-    計算方式（items）:
-      基本  = ceil( 基本時給  × 割増率 × 分/60 )
-      差額  = ceil( 差額時給  × 割増率 × 分/60 )   差額時給 = 特別時給 − 基本時給
-      小計  = 基本 + 差額                           各々切り上げてから合算
-
-    計算方式（base_only_items）:
-      基本  = ceil( 基本時給  × 割増率 × 分/60 )
-      差額  = 0
-      小計  = 基本
-    """
-    g = grp_df.copy()
-    g["差額時給"] = g[rate_col] - g[base_col]
-
-    total_base  = pd.Series(0, index=g.index, dtype=int)
-    total_extra = pd.Series(0, index=g.index, dtype=int)
-
-    rows = []
-
-    # ── 差額計算あり ──
-    for label, min_col, mult in items:
-        if min_col not in g.columns:
-            continue
-        base_pay  = g.apply(lambda r: ceil_pay(r[base_col],  mult, r[min_col]), axis=1)
-        extra_pay = g.apply(lambda r: ceil_pay(r["差額時給"], mult, r[min_col]), axis=1)
-        total_base  += base_pay
-        total_extra += extra_pay
-        rows.append((label, min_col, mult, base_pay, extra_pay, True))
-
-    # ── 基本時給のみ（差額なし）──
-    for label, min_col, mult in (base_only_items or []):
-        if min_col not in g.columns:
-            continue
-        base_pay  = g.apply(lambda r: ceil_pay(r[base_col], mult, r[min_col]), axis=1)
-        extra_pay = pd.Series(0, index=g.index, dtype=int)
-        total_base += base_pay
-        rows.append((label, min_col, mult, base_pay, extra_pay, False))
-
-    id_cols = ["従業員番号"] if "従業員番号" in g.columns else []
-    out = g[id_cols + ["氏名", base_col, rate_col, "差額時給"]].copy()
-    out[base_col]   = g[base_col].apply(lambda v: f"¥{int(v):,}")
-    out[rate_col]   = g[rate_col].apply(lambda v: f"¥{int(v):,}")
-    out["差額時給"] = g["差額時給"].apply(lambda v: f"¥{int(v):,}")
-
-    for label, min_col, mult, base_pay, extra_pay, has_extra in rows:
-        mult_str = f"×{mult:.2f}".rstrip("0").rstrip(".")
-        out[f"{label}({mult_str})(h)"] = g[min_col].apply(hhmm)
-        out[f"{label}_基本(円)"]       = base_pay.apply(yen)
-        if has_extra:
-            out[f"{label}_差額(円)"]   = extra_pay.apply(yen)
-        out[f"{label}_小計(円)"]       = (base_pay + extra_pay).apply(yen)
-
-    out["基本給分_合計(円)"]  = total_base.apply(yen)
-    out["差額追加分_合計(円)"] = total_extra.apply(yen)
-    out["支給_合計(円)"]      = (total_base + total_extra).apply(yen)
-
-    out["_基本計"] = total_base
-    out["_差額計"] = total_extra
-    out["_合計計"] = total_base + total_extra
-
+def _builtin_japanese_holidays(year: int) -> set[date]:
+    """内閣府の国民の祝日ルールに基づき祝日を計算（jpholiday に依存しない）"""
+    out: set[date] = set()
+    # 固定日
+    out.add(date(year, 1, 1))   # 元日
+    out.add(date(year, 2, 11))  # 建国記念の日
+    out.add(date(year, 2, 23))  # 天皇誕生日（2020〜）
+    out.add(date(year, 4, 29))  # 昭和の日
+    out.add(date(year, 5, 3))   # 憲法記念日
+    out.add(date(year, 5, 4))   # みどりの日
+    out.add(date(year, 5, 5))   # こどもの日
+    out.add(date(year, 11, 3))  # 文化の日
+    out.add(date(year, 11, 23)) # 勤労感謝の日
+    # 山の日（2020年は8/10、それ以外は8/11）
+    out.add(date(year, 8, 10 if year == 2020 else 11))
+    # ハッピーマンデー等
+    out.add(_nth_weekday(year, 1, 0, 2))   # 成人の日（1月第2月曜）
+    out.add(_nth_weekday(year, 7, 0, 3))   # 海の日（7月第3月曜）
+    out.add(_nth_weekday(year, 9, 0, 3))   # 敬老の日（9月第3月曜）
+    out.add(_nth_weekday(year, 10, 0, 2))  # スポーツの日（10月第2月曜）
+    # 春分の日・秋分の日
+    out.add(date(year, 3, _vernal_equinox_day(year)))
+    out.add(date(year, 9, _autumnal_equinox_day(year)))
+    # 振替休日：日曜と重なった祝日の翌日（月曜）を追加
+    for d in list(out):
+        if d.weekday() == 6:  # 日曜
+            next_mon = d.replace(day=d.day + 1)
+            if next_mon not in out:
+                out.add(next_mon)
     return out
 
-PART_WAGE = "コメダ珈琲店　パート2025.12.1"
 
-# ════════════════════════════════════════════════════════════════════════════════
-# ① 千歳北信濃店
-# ════════════════════════════════════════════════════════════════════════════════
-st.header("① 千歳北信濃店　コメダ珈琲店 パート2025.12.1")
-st.caption(
-    "**計算式**: 全日時間×基本時給×割増率（基本） ＋ 土日祝時間×差額時給×割増率（追加）　"
-    "／ 割増率: 法定内 ×1.00 / 時間外 ×1.25 / 法定休日 ×1.35 / 深夜 ×0.25"
+@st.cache_data(show_spinner=False)
+def build_jp_holiday_set(year: int) -> set[date]:
+    """祝日集合。jpholiday があれば併用、なければ内閣府ルールの自前計算のみ"""
+    builtin = _builtin_japanese_holidays(year)
+    try:
+        import jpholiday
+        for m in range(1, 13):
+            for d in range(1, 32):
+                try:
+                    dt = date(year, m, d)
+                    if jpholiday.is_holiday(dt):
+                        builtin.add(dt)
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+    return builtin
+
+
+def parse_manual_holidays(text: str) -> list[date]:
+    """カンマ/改行/空白区切りの日付文字列（YYYY-MM-DD）をパースして date のリストで返す"""
+    if not text.strip():
+        return []
+    parts = re.split(r"[,\n\r\t ]+", text.strip())
+    out: list[date] = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            out.append(date.fromisoformat(p))
+        except Exception:
+            pass
+    return out
+
+
+# =========================
+# 従業員情報CSV読込（freeeエクスポート形式）
+# =========================
+E_COL_EMP_NO  = "従業員番号"
+E_COL_WAGE    = "給与方式"
+E_COL_BASE    = "基本給"
+E_TIMEBAND_MAX = 5  # 時間帯ごとの時給は最大5件
+
+
+def load_emp_premium_map(upload) -> dict[str, int]:
+    """freee従業員情報CSVから {従業員番号: 土日祝加算単価(円/h)} を返す。
+    時給従業員で「土日祝」という名前の時間帯時給が設定されている場合:
+      加算単価 = 土日祝時給 - 基本時給
+    それ以外の従業員はデフォルト PREMIUM_PER_HOUR を使う（辞書には入れない）。
+    """
+    raw = upload.getvalue()
+    for enc in ("utf-8-sig", "cp932", "utf-8"):
+        try:
+            df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str)
+            break
+        except Exception:
+            continue
+    else:
+        return {}
+
+    result: dict[str, int] = {}
+    for _, row in df.iterrows():
+        emp_no = normalize_text(row.get(E_COL_EMP_NO, ""))
+        if not emp_no:
+            continue
+        emp_no_norm = emp_no.lstrip("0") or "0"
+
+        wage_type = normalize_text(row.get(E_COL_WAGE, ""))
+        if wage_type != "時給":
+            continue
+
+        try:
+            base = int(str(row.get(E_COL_BASE, "")).strip())
+        except (ValueError, TypeError):
+            continue
+
+        # 時間帯ごとの時給1〜5 の中から「土日祝」を探す
+        wknd_amt: int | None = None
+        for n in range(1, E_TIMEBAND_MAX + 1):
+            name_col = f"時間帯ごとの時給{n} 名前"
+            amt_col  = f"時間帯ごとの時給{n} 金額"
+            name_val = normalize_text(row.get(name_col, ""))
+            if "土日祝" in name_val:
+                try:
+                    wknd_amt = int(str(row.get(amt_col, "")).strip())
+                except (ValueError, TypeError):
+                    pass
+                break
+
+        if wknd_amt is None:
+            continue
+
+        diff = wknd_amt - base
+        if diff > 0:
+            result[emp_no_norm] = diff
+
+    return result
+
+
+# =========================
+# 計算
+# =========================
+def compute(
+    df,
+    store_name,
+    year,
+    month,
+    use_holiday,
+    manual_holidays: set[date] | None = None,
+    emp_premium_map: dict[str, int] | None = None,
+):
+    df = df.copy()
+    df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+    df = df[df[COL_DATE].notna()]
+
+    df["_dept_norm"] = df[COL_DEPT].apply(normalize_text)
+    store_norm = normalize_text(store_name)
+    df = df[df["_dept_norm"].str.contains(store_norm, na=False)]
+
+    df["year"] = df[COL_DATE].dt.year
+    df["month"] = df[COL_DATE].dt.month
+    df = df[(df["year"]==year) & (df["month"]==month)]
+
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    holidays = build_jp_holiday_set(year)
+    if use_holiday and manual_holidays:
+        holidays = holidays | set(manual_holidays)
+    df["date_only"] = df[COL_DATE].dt.date
+    df["is_holiday"] = df["date_only"].apply(
+        lambda d: d.weekday()>=5 or (use_holiday and d in holidays)
+    )
+
+    df = df[df["is_holiday"]]
+
+    for k, col in TIME_COLS.items():
+        if col not in df.columns:
+            df[f"{k}_mins"] = 0
+        else:
+            df[f"{k}_mins"] = df[col].apply(hhmm_to_minutes)
+
+    # 有給（実労働0）の日は割増対象から除外
+    df["_work_mins"] = df[[f"{k}_mins" for k in TIME_COLS]].sum(axis=1)
+    df = df[df["_work_mins"] > 0].drop(columns=["_work_mins"])
+
+    # 土日祝で有給休暇の日は割増対象から除外（勤怠種別で判定）
+    if COL_ATTENDANCE_TYPE in df.columns:
+        df["_attendance_norm"] = df[COL_ATTENDANCE_TYPE].apply(normalize_text)
+        df = df[df["_attendance_norm"] != "有給休暇"].drop(columns=["_attendance_norm"])
+
+    g = df.groupby([COL_EMP_NO, COL_NAME]).sum(numeric_only=True).reset_index()
+
+    def _premium(emp_no: str) -> int:
+        key = str(emp_no).strip().lstrip("0") or "0"
+        if emp_premium_map and key in emp_premium_map:
+            return emp_premium_map[key]
+        return PREMIUM_PER_HOUR
+
+    for k in TIME_COLS:
+        rate = RATES[k]
+        g[f"{k}加算額"] = g.apply(
+            lambda row, k=k, rate=rate: math.ceil(
+                row[f"{k}_mins"] * _premium(row[COL_EMP_NO]) * rate / 60
+            ),
+            axis=1,
+        )
+
+    g["土日祝単価"] = g[COL_EMP_NO].apply(lambda x: _premium(x))
+
+    add_cols = [f"{k}加算額" for k in TIME_COLS]
+    g["合計"] = g[add_cols].sum(axis=1)
+
+    return g, pd.DataFrame([{
+        COL_EMP_NO: "合計",
+        COL_NAME: store_name,
+        "合計": int(g["合計"].sum())
+    }])
+
+# =========================
+# UI
+# =========================
+st.set_page_config(layout="wide")
+st.title("日次勤怠CSV → 土日祝加算額 自動計算")
+
+up = st.file_uploader("日次勤怠CSV（ジョブカン日次エクスポート）", type="csv")
+up_master = st.file_uploader(
+    "従業員情報CSV（freeeエクスポート・任意）：時間帯時給「土日祝」が設定されている場合は「土日祝時給 − 基本時給」で計算します",
+    type="csv",
 )
+use_holiday = st.checkbox("祝日も含める", value=True)
 
-CHITOSE_DEPT = "コメダ珈琲店　千歳北信濃店"
-mask_c = df["部門"].str.contains(CHITOSE_DEPT, na=False) & (df["勤務・賃金"] == PART_WAGE)
-df_c = df[mask_c].copy()
-df_c["土日祝"] = df_c["日付"].apply(is_weekend_or_holiday)
-df_ot = df_c[df_c["土日祝"]].copy()
+if not up:
+    st.stop()
 
-# 対象カテゴリ（label, 元列名, 割増率）
-CHITOSE_CATS = [
-    ("法定内残業", "法定内残業時間",   1.00),
-    ("時間外",    "時間外労働時間",   1.25),
-    ("法定休日",  "法定休日労働時間",  1.35),
-    ("深夜",     "深夜労働時間",     0.25),
-]
+df = safe_read_csv(up)
 
-# 全日・土日祝それぞれの分換算列を付与
-for label, col, mult in CHITOSE_CATS:
-    df_c[f"_A_{label}"] = parse_col(df_c[col])   # 全日（A = All）
-    df_ot[f"_W_{label}"] = parse_col(df_ot[col]) # 土日祝（W = Weekend）
+dept_list = sorted(df[COL_DEPT].dropna().unique())
+store = st.selectbox("対象部門（店舗）", dept_list)
 
-# 土日祝のうち残業・深夜のある行を日別表示対象とする
-df_ot["_残業深夜_分"] = sum(df_ot[f"_W_{label}"] for label, _, _ in CHITOSE_CATS)
-df_show = df_ot[df_ot["_残業深夜_分"] > 0].copy()
+ym = pd.to_datetime(df[COL_DATE], errors="coerce").dt.to_period("M").astype(str).dropna().unique().tolist()
+ym_sel = st.selectbox("対象年月", sorted(ym))
+y, m = ym_sel.split("-")
+iy, im = int(y), int(m)
 
-# ── 1-A. 土日祝の残業・深夜 ──────────────────────────────────────────────────
-st.subheader("1-A. 土日祝の残業・深夜時間（日別明細）")
+# 処理月の祝日表示・手入力で補完
+manual_key = f"manual_holidays_{ym_sel}"
+if manual_key not in st.session_state:
+    st.session_state[manual_key] = ""
+if manual_key + "_set" not in st.session_state:
+    st.session_state[manual_key + "_set"] = set()
 
-if df_show.empty:
-    st.info("土日祝の残業・深夜レコードはありません。")
-else:
-    disp = pd.DataFrame()
-    disp["日付"]       = df_show["日付"].dt.strftime("%Y/%m/%d")
-    disp["曜日"]       = df_show["曜日"]
-    disp["氏名"]       = df_show["氏名"]
-    disp["基本時給"]   = df_show["基本時給"].apply(lambda v: f"¥{int(v):,}")
-    disp["土日祝時給"] = df_show["土日祝時給"].apply(lambda v: f"¥{int(v):,}")
-    for label, col, mult in CHITOSE_CATS:
-        disp[f"{label}(h)"] = df_show[f"_W_{label}"].apply(hhmm)
-    st.dataframe(disp.reset_index(drop=True), use_container_width=True)
+holidays_year = build_jp_holiday_set(iy)
+month_holidays = sorted([d for d in holidays_year if d.year == iy and d.month == im])
 
-    # ── 従業員別月次集計・支給額 ──────────────────────────────────────────────
-    st.subheader("従業員別月次集計・支給額内訳")
+with st.expander("処理月の祝日（表示・手入力で補完）", expanded=False):
+    if month_holidays:
+        hd_df = pd.DataFrame({
+            "日付": [d.isoformat() for d in month_holidays],
+            "曜日": [["月", "火", "水", "木", "金", "土", "日"][d.weekday()] for d in month_holidays],
+        })
+        st.dataframe(hd_df, use_container_width=True, height=240)
+    else:
+        st.info("この月は（自動判定上）祝日がありません。")
 
-    # 全日集計（df_c）
-    a_cols = [f"_A_{label}" for label, _, _ in CHITOSE_CATS]
-    grp_all = df_c.groupby(["従業員番号", "氏名", "基本時給", "土日祝時給"])[a_cols].sum().reset_index()
+    text = st.text_area(
+        "追加したい祝日（YYYY-MM-DD。カンマ/改行区切り）※当月のみ反映",
+        value=st.session_state[manual_key],
+        placeholder="例）2026-09-22\n2026-09-23",
+        height=100,
+    )
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("祝日を追加（当月のみ）", key=manual_key + "_add"):
+            ds = parse_manual_holidays(text)
+            valid = [d for d in ds if d.year == iy and d.month == im]
+            invalid = len(ds) - len(valid)
+            st.session_state[manual_key] = text
+            st.session_state[manual_key + "_set"] = set(valid)
+            if invalid:
+                st.warning(f"当月以外 or 形式不正のため除外: {invalid}件")
+            st.success(f"当月の追加祝日: {len(set(valid))}件を反映しました。")
+    with col2:
+        if st.button("当月の追加祝日をクリア", key=manual_key + "_clear"):
+            st.session_state[manual_key] = ""
+            st.session_state[manual_key + "_set"] = set()
+            st.success("クリアしました。")
 
-    # 土日祝残業ありの行のみで集計（df_show）
-    w_cols = [f"_W_{label}" for label, _, _ in CHITOSE_CATS]
-    grp_wk  = df_show.groupby(["従業員番号", "氏名", "基本時給", "土日祝時給"])[w_cols].sum().reset_index()
+manual_holidays = st.session_state.get(manual_key + "_set", set())
 
-    # 土日祝残業ありの従業員のみを対象に全日時間をマージ・従業員番号順にソート
-    grp = grp_wk.merge(grp_all, on=["従業員番号", "氏名", "基本時給", "土日祝時給"], how="left")
-    for c in a_cols:
-        grp[c] = grp[c].fillna(0).astype(int)
-    grp = grp.sort_values("従業員番号").reset_index(drop=True)
+# 漏れ検知ヒント（当月・CSV内の平日で休日候補に含まれていない日）
+if use_holiday:
+    try:
+        dt_ser = pd.to_datetime(df[COL_DATE], errors="coerce")
+        mask = (dt_ser.dt.year == iy) & (dt_ser.dt.month == im)
+        month_dates = dt_ser.loc[mask].dt.date.unique()
+        all_holidays = holidays_year | manual_holidays
+        missed = sum(1 for d in month_dates if d.weekday() < 5 and d not in all_holidays)
+        if missed > 0:
+            st.caption(f"祝日漏れの可能性：{missed}日（平日で休日候補に含まれていない日がCSVにあります）")
+    except Exception:
+        pass
 
-    # 支給額計算
-    g = grp.copy()
-    g["差額時給"] = g["土日祝時給"] - g["基本時給"]
+emp_premium_map: dict[str, int] | None = None
+if up_master is not None:
+    emp_premium_map = load_emp_premium_map(up_master)
+    st.caption(f"従業員マスタ読込：土日祝単価設定あり {len(emp_premium_map)} 名（その他は {PREMIUM_PER_HOUR}円/h）")
 
-    total_base  = pd.Series(0, index=g.index, dtype=int)
-    total_extra = pd.Series(0, index=g.index, dtype=int)
+if st.button("計算する"):
+    res, total = compute(df, store, iy, im, use_holiday, manual_holidays, emp_premium_map)
 
-    out = g[["従業員番号", "氏名", "基本時給", "土日祝時給", "差額時給"]].copy()
-    out["基本時給"]   = g["基本時給"].apply(lambda v: f"¥{int(v):,}")
-    out["土日祝時給"] = g["土日祝時給"].apply(lambda v: f"¥{int(v):,}")
-    out["差額時給"]   = g["差額時給"].apply(lambda v: f"¥{int(v):,}")
+    if res.empty:
+        st.error("対象データがありません（部門名 or 年月が一致していません）")
+        st.stop()
 
-    for label, col, mult in CHITOSE_CATS:
-        a_col = f"_A_{label}"
-        w_col = f"_W_{label}"
-        mult_str = f"×{mult:.2f}".rstrip("0").rstrip(".")
+    st.dataframe(res)
+    st.dataframe(total)
 
-        base_pay  = g.apply(
-            lambda r, ac=a_col, m=mult: ceil_pay(r["基本時給"],  m, r[ac]), axis=1)
-        extra_pay = g.apply(
-            lambda r, wc=w_col, m=mult: ceil_pay(r["差額時給"],  m, r[wc]), axis=1)
-        total_base  += base_pay
-        total_extra += extra_pay
-
-        out[f"{label}({mult_str})_全日(h)"]  = g[a_col].apply(hhmm)
-        out[f"{label}_土日祝(h)"]            = g[w_col].apply(hhmm)
-        out[f"{label}_全日基本(円)"]         = base_pay.apply(yen)
-        out[f"{label}_追加(円)"]             = extra_pay.apply(yen)
-        out[f"{label}_小計(円)"]             = (base_pay + extra_pay).apply(yen)
-
-    out["基本合計(円)"]  = total_base.apply(yen)
-    out["差額追加(円)"]  = total_extra.apply(yen)
-    out["支給合計(円)"]  = (total_base + total_extra).apply(yen)
-
-    st.dataframe(out.reset_index(drop=True), use_container_width=True)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("基本給分 合計（参照）", yen(total_base.sum()))
-    m2.metric("差額追加分 合計", yen(total_extra.sum()))
-    m3.metric("支給 合計", yen((total_base + total_extra).sum()))
-
-st.divider()
-
-# ── 1-B. 有給休暇 ────────────────────────────────────────────────────────────
-st.subheader("1-B. 有給休暇時間（勤怠種別＝有休）")
-
-df_yu = df_c[df_c["勤怠種別"] == "有休"].copy()
-
-if df_yu.empty:
-    st.info("有休レコードはありません。")
-else:
-    yu_cols = [c for c in ["日付","曜日","氏名","有休時間 - 合計","有休時間 - 半休","有休時間 - 時間休"]
-               if c in df_yu.columns]
-    st.dataframe(df_yu[yu_cols].reset_index(drop=True), use_container_width=True)
-    total_yu = parse_col(df_yu["有休時間 - 合計"]).sum()
-    st.markdown(f"**有休時間 合計: `{hhmm(total_yu)}`**")
-
-    st.subheader("従業員別 有給休暇合計")
-    gy = (df_yu.groupby(["従業員番号", "氏名"])["有休時間 - 合計"]
-          .apply(lambda s: parse_col(s).sum()).reset_index())
-    gy.columns = ["従業員番号", "氏名", "有休(分)"]
-    gy = gy.sort_values("従業員番号").reset_index(drop=True)
-    gy["有休合計"] = gy["有休(分)"].apply(hhmm)
-    st.dataframe(gy[["従業員番号", "氏名", "有休合計"]], use_container_width=True)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# ② 旭川買物公園通り店
-# ════════════════════════════════════════════════════════════════════════════════
-st.header("② 旭川買物公園通り店　コメダ珈琲店 パート2025.12.1")
-st.caption(
-    "**計算式**: 差額時給（早朝時給−基本時給）× 割増率 × 月合計時間 = 差額追加分　"
-    "／ 早朝実働・法定内残業ともに ×1.00"
-)
-
-ASAHIKAWA_DEPT = "コメダ珈琲店　旭川買物公園通り店"
-mask_a = df["部門"].str.contains(ASAHIKAWA_DEPT, na=False) & (df["勤務・賃金"] == PART_WAGE)
-df_a = df[mask_a].copy()
-
-df_a["早朝_分"]    = df_a.apply(calc_early_min, axis=1)
-df_a["早朝残業_分"] = df_a.apply(calc_early_overtime_min, axis=1)
-
-df_early = df_a[df_a["早朝_分"] > 0].copy()
-df_ot_am = df_a[df_a["早朝残業_分"] > 0].copy()
-
-# ── 早朝実働 ─────────────────────────────────────────────────────────────────
-st.subheader("早朝実働時間（6:00〜9:00）")
-
-if df_early.empty:
-    st.info("早朝（6:00〜9:00）勤務のレコードはありません。")
-else:
-    disp2 = pd.DataFrame()
-    disp2["日付"]        = df_early["日付"].dt.strftime("%Y/%m/%d")
-    disp2["曜日"]        = df_early["曜日"]
-    disp2["氏名"]        = df_early["氏名"]
-    disp2["出勤時刻"]    = df_early["出勤時刻"]
-    disp2["退勤時刻"]    = df_early["退勤時刻"]
-    disp2["早朝時間(h)"] = df_early["早朝_分"].apply(hhmm)
-    st.dataframe(disp2.reset_index(drop=True), use_container_width=True)
-
-    st.subheader("従業員別月次集計・支給額内訳（早朝実働）")
-    g2 = (df_early.groupby(["従業員番号", "氏名","基本時給","早朝時給"])[["早朝_分"]]
-          .sum().reset_index().sort_values("従業員番号").reset_index(drop=True))
-    pt2 = make_pay_table(g2, "早朝時給", "基本時給", [("早朝実働", "早朝_分", 1.00)])
-    dcols2 = [c for c in pt2.columns if not c.startswith("_")]
-    st.dataframe(pt2[dcols2].reset_index(drop=True), use_container_width=True)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("基本給分 合計（参照）", yen(pt2["_基本計"].sum()))
-    m2.metric("差額追加分 合計", yen(pt2["_差額計"].sum()))
-    m3.metric("支給 合計", yen(pt2["_合計計"].sum()))
-
-st.divider()
-
-# ── 早朝法定内残業 ────────────────────────────────────────────────────────────
-st.subheader("早朝法定内残業（予定退勤≤9:00 で実退勤がそれを超えた分）")
-st.caption("早朝法定内残業 = min(実退勤, 09:00) − 勤務予定退勤時刻　×1.00（早朝時給で差額計算）")
-
-if df_ot_am.empty:
-    st.info("早朝法定内残業のレコードはありません。")
-else:
-    disp3 = pd.DataFrame()
-    disp3["日付"]         = df_ot_am["日付"].dt.strftime("%Y/%m/%d")
-    disp3["曜日"]         = df_ot_am["曜日"]
-    disp3["氏名"]         = df_ot_am["氏名"]
-    disp3["勤務予定退勤"] = df_ot_am["勤務予定退勤時刻"]
-    disp3["退勤時刻"]     = df_ot_am["退勤時刻"]
-    disp3["早朝残業(h)"]  = df_ot_am["早朝残業_分"].apply(hhmm)
-    st.dataframe(disp3.reset_index(drop=True), use_container_width=True)
-
-    st.subheader("従業員別月次集計・支給額内訳（早朝法定内残業）")
-    g3 = (df_ot_am.groupby(["従業員番号", "氏名","基本時給","早朝時給"])[["早朝残業_分"]]
-          .sum().reset_index().sort_values("従業員番号").reset_index(drop=True))
-    pt3 = make_pay_table(g3, "早朝時給", "基本時給", [("早朝残業", "早朝残業_分", 1.00)])
-    dcols3 = [c for c in pt3.columns if not c.startswith("_")]
-    st.dataframe(pt3[dcols3].reset_index(drop=True), use_container_width=True)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("基本給分 合計（参照）", yen(pt3["_基本計"].sum()))
-    m2.metric("差額追加分 合計", yen(pt3["_差額計"].sum()))
-    m3.metric("支給 合計", yen(pt3["_合計計"].sum()))
+    # 計算結果を1つのCSVにまとめてダウンロード（UTF-8 BOMでExcelでも文字化けしない）
+    out = pd.concat([res, total], ignore_index=True)
+    csv_bytes = out.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="計算結果をCSVでダウンロード",
+        data=csv_bytes,
+        file_name=f"土日祝加算額_{store}_{ym_sel}.csv",
+        mime="text/csv",
+    )
