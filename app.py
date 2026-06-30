@@ -328,8 +328,30 @@ def read_jobcan_excels(files: List[Tuple[str, bytes]]) -> Tuple[int, int, Dict[s
 # =========================
 # Schedule CSV (fixed columns)
 # =========================
+def load_employee_name_map(csv_bytes: bytes) -> Dict[str, str]:
+    """従業員情報CSVから 従業員番号 → 表示名（姓+名） の辞書を返す"""
+    try:
+        df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str)
+    except Exception:
+        df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str, encoding="utf-8-sig")
+    name_map: Dict[str, str] = {}
+    if "従業員番号" not in df.columns:
+        return name_map
+    for _, row in df.iterrows():
+        code = normalize_employee_number(row.get("従業員番号"))
+        if code == "":
+            continue
+        sei = safe_str(row.get("姓", ""))
+        mei = safe_str(row.get("名", ""))
+        display = (sei + " " + mei).strip()
+        if display:
+            name_map[code] = display
+    return name_map
+
+
 def build_schedule_csv_fixed(
     staff_rows: Dict[str, List[Dict[str, Any]]],
+    employee_name_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[pd.DataFrame, bytes]:
     """
     固定列CSVを生成する（freee API 不使用）。
@@ -394,7 +416,8 @@ def build_schedule_csv_fixed(
 
             row = new_row()
             row["従業員番号"] = staff_code
-            row["freee人事労務での表示名（編集しても反映されません）"] = ""
+            display_name = (employee_name_map or {}).get(staff_code, "")
+            row["freee人事労務での表示名（編集しても反映されません）"] = display_name
             row["日付"] = wd.strftime("%Y-%m-%d")
             row["勤務パターンコード"] = ""
             row["夜勤日種別"] = ""
@@ -461,6 +484,12 @@ uploaded_excels = st.file_uploader(
     accept_multiple_files=True,
 )
 
+uploaded_employee_csv = st.file_uploader(
+    "従業員情報CSV（freee人事労務エクスポート）※任意：従業員番号で氏名を補完します",
+    type=["csv"],
+    accept_multiple_files=False,
+)
+
 if not uploaded_excels:
     st.info("Excelファイルをアップロードしてください。")
     st.stop()
@@ -471,7 +500,12 @@ if st.button("CSVを生成", type="primary"):
         year, month, staff_rows = read_jobcan_excels_cached(files)
         st.success(f"[OK] Excel読込完了：{year}年{month}月 / 対象従業員（シート数ベース）={len(staff_rows)}名")
 
-        schedule_df, schedule_bytes = build_schedule_csv_fixed(staff_rows)
+        employee_name_map: Optional[Dict[str, str]] = None
+        if uploaded_employee_csv is not None:
+            employee_name_map = load_employee_name_map(uploaded_employee_csv.getvalue())
+            st.success(f"[OK] 従業員情報CSV読込完了：{len(employee_name_map)}名の氏名を補完します")
+
+        schedule_df, schedule_bytes = build_schedule_csv_fixed(staff_rows, employee_name_map)
         st.success(f"[OK] スケジュールCSV生成：rows={len(schedule_df)}")
 
         st.session_state["schedule_bytes"] = schedule_bytes
